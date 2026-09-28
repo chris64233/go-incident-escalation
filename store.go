@@ -38,6 +38,8 @@ type CreateIncidentRequest struct {
 	PolicyID   string
 	Severity   string
 	Detail     string
+	// OwnerGroup 初始负责的值班组，为空则归入 DefaultGroup。
+	OwnerGroup string
 }
 
 // AckRequest 确认事件。RequestID 是外部请求号，用于幂等。
@@ -54,11 +56,20 @@ type ResolveRequest struct {
 	ResolvedBy string
 }
 
+// HandoffRequest 执行一次值班交接：把 FromGroup 名下仍未确认/未解决的事件
+// 及其未派发的通知整体移交给 ToGroup。RequestID 是外部请求号，用于幂等。
+type HandoffRequest struct {
+	RequestID string
+	HandoffID string // 可选，为空则自动生成
+	FromGroup string
+	ToGroup   string
+}
+
 // requestRecord 记录一个外部请求号对应的请求内容指纹与结果，用于幂等与冲突检测。
 type requestRecord struct {
-	Kind        string `json:"kind"`        // create_incident | acknowledge | resolve
+	Kind        string `json:"kind"`        // create_incident | acknowledge | resolve | handoff
 	Fingerprint string `json:"fingerprint"` // 请求内容指纹
-	IncidentID  string `json:"incident_id"` // 幂等重放时定位结果
+	IncidentID  string `json:"incident_id"` // 幂等重放时定位结果（交接单存交接单 ID）
 }
 
 // timerRecord 是 Timer 的持久化形态（当前同构，独立命名以便演进）。
@@ -66,15 +77,16 @@ type timerRecord = Timer
 
 // snapshot 是一次性原子落盘的完整状态：事件状态、定时器、outbox 同生共死。
 type snapshot struct {
-	Policies     map[string]*Policy       `json:"policies"`
-	Incidents    map[string]*Incident     `json:"incidents"`
-	Outbox       []*OutboxItem            `json:"outbox"`
-	NextOutboxID int64                    `json:"next_outbox_id"`
-	Timers       map[string]*timerRecord  `json:"timers"`       // incidentID -> 唯一定时器
-	SentIntents  map[string]struct{}      `json:"sent_intents"` // "incidentID\x00step\x00target" 去重
-	Requests     map[string]requestRecord `json:"requests"`
-	History      []HistoryEntry           `json:"history"`
-	NextSeq      int64                    `json:"next_seq"`
+	Policies     map[string]*Policy        `json:"policies"`
+	Incidents    map[string]*Incident      `json:"incidents"`
+	Outbox       []*OutboxItem             `json:"outbox"`
+	NextOutboxID int64                     `json:"next_outbox_id"`
+	Timers       map[string]*timerRecord   `json:"timers"`       // incidentID -> 唯一定时器
+	SentIntents  map[string]struct{}       `json:"sent_intents"` // "incidentID\x00step\x00target" 去重
+	Requests     map[string]requestRecord  `json:"requests"`
+	Handoffs     map[string]*HandoffRecord `json:"handoffs"` // handoffID -> 交接单
+	History      []HistoryEntry            `json:"history"`
+	NextSeq      int64                     `json:"next_seq"`
 }
 
 func newSnapshot() *snapshot {
@@ -84,6 +96,7 @@ func newSnapshot() *snapshot {
 		Timers:      map[string]*timerRecord{},
 		SentIntents: map[string]struct{}{},
 		Requests:    map[string]requestRecord{},
+		Handoffs:    map[string]*HandoffRecord{},
 	}
 }
 
@@ -139,6 +152,23 @@ func (snap *snapshot) afterLoad() {
 	}
 	if snap.Requests == nil {
 		snap.Requests = map[string]requestRecord{}
+	}
+	if snap.Handoffs == nil {
+		snap.Handoffs = map[string]*HandoffRecord{}
+	}
+	// 兼容交接功能之前的旧快照：补齐默认值班组与意图类型。
+	for _, inc := range snap.Incidents {
+		if inc.OwnerGroup == "" {
+			inc.OwnerGroup = DefaultGroup
+		}
+	}
+	for _, item := range snap.Outbox {
+		if item.Kind == "" {
+			item.Kind = OutboxKindEscalation
+		}
+		if item.OwnerGroup == "" {
+			item.OwnerGroup = DefaultGroup
+		}
 	}
 }
 
@@ -367,7 +397,8 @@ func (s *Store) CreateIncident(req CreateIncidentRequest, now time.Time) (*Incid
 		PolicyID   string `json:"policy_id"`
 		Severity   string `json:"severity"`
 		Detail     string `json:"detail"`
-	}{req.IncidentID, req.PolicyID, req.Severity, req.Detail}
+		OwnerGroup string `json:"owner_group"`
+	}{req.IncidentID, req.PolicyID, req.Severity, req.Detail, req.OwnerGroup}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -392,12 +423,17 @@ func (s *Store) CreateIncident(req CreateIncidentRequest, now time.Time) (*Incid
 		return nil, fmt.Errorf("%w: incident %q", ErrAlreadyExists, id)
 	}
 
+	owner := req.OwnerGroup
+	if owner == "" {
+		owner = DefaultGroup
+	}
 	inc := &Incident{
 		ID:          id,
 		PolicyID:    req.PolicyID,
 		Severity:    req.Severity,
 		Detail:      req.Detail,
 		Status:      StatusFiring,
+		OwnerGroup:  owner,
 		FrozenSteps: cloneSteps(p.Steps), // 冻结：之后策略如何改都与本事件无关
 		StartedAt:   now,
 		FiredAt:     make([]time.Time, len(p.Steps)),
@@ -493,6 +529,140 @@ func (s *Store) Resolve(req ResolveRequest, now time.Time) (*Incident, error) {
 		return nil, err
 	}
 	return s.getIncidentLocked(inc.ID)
+}
+
+// ---------- 值班交接 ----------
+
+// Handoff 执行值班交接：在生效瞬间冻结“FromGroup 名下仍处于 firing 的事件”清单，
+// 并在同一次原子写入中完成：
+//   - 移交事件的负责人改为 ToGroup；
+//   - 这些事件尚未派发的 outbox 意图改派给 ToGroup（已投递的保留原记录）；
+//   - 为每个移交事件生成一条发给 ToGroup 的交接通知（按交接单号去重）。
+//
+// 已确认/已解决的事件不移交；与确认/解决并发时由同一把互斥锁串行化，
+// 谁先提交谁生效，最终只收敛出一个结果。同 RequestID 重放返回原交接单，
+// 不会再次更换负责人或重复通知；对同一 FromGroup 再次交接只会冻结到空清单。
+func (s *Store) Handoff(req HandoffRequest, now time.Time) (*HandoffRecord, error) {
+	if strings.TrimSpace(req.FromGroup) == "" || strings.TrimSpace(req.ToGroup) == "" {
+		return nil, fmt.Errorf("%w: from_group and to_group are required", ErrInvalidArgument)
+	}
+	if req.FromGroup == req.ToGroup {
+		return nil, fmt.Errorf("%w: from_group and to_group must differ", ErrInvalidArgument)
+	}
+	content := struct {
+		HandoffID string `json:"handoff_id"`
+		FromGroup string `json:"from_group"`
+		ToGroup   string `json:"to_group"`
+	}{req.HandoffID, req.FromGroup, req.ToGroup}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existingID, replay, err := s.checkRequestLocked("handoff", req.RequestID, content); err != nil {
+		return nil, err
+	} else if replay {
+		return s.getHandoffLocked(existingID)
+	}
+
+	id := req.HandoffID
+	if id == "" {
+		s.snap.NextSeq++
+		id = fmt.Sprintf("ho-%d", s.snap.NextSeq)
+	}
+	if _, exists := s.snap.Handoffs[id]; exists {
+		return nil, fmt.Errorf("%w: handoff %q", ErrAlreadyExists, id)
+	}
+
+	// 冻结待移交清单：仅当前归 FromGroup 且未确认/未解决的事件。
+	var ids []string
+	for _, inc := range s.snap.Incidents {
+		if inc.OwnerGroup == req.FromGroup && inc.Status == StatusFiring {
+			ids = append(ids, inc.ID)
+		}
+	}
+	sort.Strings(ids)
+
+	for _, incID := range ids {
+		inc := s.snap.Incidents[incID]
+		inc.OwnerGroup = req.ToGroup
+		inc.UpdatedAt = now
+		// 尚未派发的通知只能由一方继续处理：随事件原子改派给新班组；
+		// 已投递的意图是历史事实，保留原记录不动。
+		for _, item := range s.snap.Outbox {
+			if item.IncidentID == incID && item.Status == OutboxPending {
+				item.OwnerGroup = req.ToGroup
+			}
+		}
+		// 交接通知：同一事件、同一交接单只产生一条意图。
+		key := intentKey(incID, -1, "handoff:"+id)
+		if _, dup := s.snap.SentIntents[key]; !dup {
+			s.snap.SentIntents[key] = struct{}{}
+			s.snap.NextOutboxID++
+			s.snap.Outbox = append(s.snap.Outbox, &OutboxItem{
+				ID:         s.snap.NextOutboxID,
+				IncidentID: incID,
+				StepIndex:  -1,
+				Target:     req.ToGroup,
+				Channel:    "default",
+				Kind:       OutboxKindHandoff,
+				OwnerGroup: req.ToGroup,
+				Message: fmt.Sprintf("[incident %s] handed off from %s to %s: %s",
+					incID, req.FromGroup, req.ToGroup, inc.Detail),
+				Status:    OutboxPending,
+				CreatedAt: now,
+			})
+		}
+		s.appendHistoryLocked(incID, "handoff",
+			fmt.Sprintf("handoff=%s from=%s to=%s", id, req.FromGroup, req.ToGroup), now)
+	}
+
+	rec := &HandoffRecord{
+		ID:          id,
+		RequestID:   req.RequestID,
+		FromGroup:   req.FromGroup,
+		ToGroup:     req.ToGroup,
+		IncidentIDs: ids,
+		CreatedAt:   now,
+	}
+	s.snap.Handoffs[id] = rec
+	s.rememberRequestLocked("handoff", req.RequestID, id, content)
+	if err := s.commitLocked(); err != nil {
+		return nil, err
+	}
+	return cloneHandoff(rec), nil
+}
+
+// GetHandoff 读取交接单。
+func (s *Store) GetHandoff(id string) (*HandoffRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getHandoffLocked(id)
+}
+
+func (s *Store) getHandoffLocked(id string) (*HandoffRecord, error) {
+	rec, ok := s.snap.Handoffs[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: handoff %q", ErrNotFound, id)
+	}
+	return cloneHandoff(rec), nil
+}
+
+// ListHandoffs 列出全部交接单，按生效时间排序。
+func (s *Store) ListHandoffs() []*HandoffRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*HandoffRecord, 0, len(s.snap.Handoffs))
+	for _, rec := range s.snap.Handoffs {
+		out = append(out, cloneHandoff(rec))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+func cloneHandoff(rec *HandoffRecord) *HandoffRecord {
+	cp := *rec
+	cp.IncidentIDs = append([]string(nil), rec.IncidentIDs...)
+	return &cp
 }
 
 // GetIncident 读取事件。
@@ -613,6 +783,9 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 				StepIndex:  idx,
 				Target:     target,
 				Channel:    "default",
+				Kind:       OutboxKindEscalation,
+				// 意图归事件当前负责的班组派发；交接后新步骤自然由新班组接手。
+				OwnerGroup: inc.OwnerGroup,
 				Message: fmt.Sprintf("[incident %s] escalation step %d: %s",
 					id, idx, inc.Detail),
 				Status:    OutboxPending,
@@ -652,14 +825,29 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 
 // PendingOutbox 返回所有尚未投递的通知意图，按 ID 排序。
 func (s *Store) PendingOutbox() []*OutboxItem {
+	return s.pendingOutboxFor("")
+}
+
+// PendingOutboxFor 返回指定值班组负责派发的未投递意图，按 ID 排序。
+// 交接后旧班组在这里不再看到已改派的意图，新班组接着处理，
+// 同一条 pending 意图任何时候只有一方可见。
+func (s *Store) PendingOutboxFor(group string) []*OutboxItem {
+	return s.pendingOutboxFor(group)
+}
+
+func (s *Store) pendingOutboxFor(group string) []*OutboxItem {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*OutboxItem
 	for _, item := range s.snap.Outbox {
-		if item.Status == OutboxPending {
-			cp := *item
-			out = append(out, &cp)
+		if item.Status != OutboxPending {
+			continue
 		}
+		if group != "" && item.OwnerGroup != group {
+			continue
+		}
+		cp := *item
+		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out

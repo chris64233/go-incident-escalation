@@ -26,6 +26,9 @@ type Config struct {
 	DispatchInterval time.Duration
 	// Now 可注入时钟（测试用）；为 nil 时用 time.Now。
 	Now func() time.Time
+	// Group 非空时，投递循环只处理该值班组名下的 pending 意图。
+	// 交接把意图改派给新班组后，旧班组的 Service 不会再碰到它们。
+	Group string
 }
 
 // Service 在 Store 之上提供后台“到期推进 + outbox 投递”循环。
@@ -128,7 +131,7 @@ func (svc *Service) runDispatch(stop, stopped chan struct{}) {
 }
 
 func (svc *Service) drainOutbox() {
-	for _, item := range svc.store.PendingOutbox() {
+	for _, item := range svc.store.PendingOutboxFor(svc.cfg.Group) {
 		if err := svc.dispatcher.Dispatch(*item); err != nil {
 			// 投递失败：保留 pending，下轮重试；跳过本条，不阻塞其它意图。
 			continue
