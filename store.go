@@ -38,6 +38,8 @@ type CreateIncidentRequest struct {
 	PolicyID   string
 	Severity   string
 	Detail     string
+	// AssignedTeam 是事件初始责任班组；后续可通过值班交接整体替换。
+	AssignedTeam string
 }
 
 // AckRequest 确认事件。RequestID 是外部请求号，用于幂等。
@@ -54,11 +56,19 @@ type ResolveRequest struct {
 	ResolvedBy string
 }
 
+// HandoffRequest 请求执行一次值班交接。RequestID 是外部请求号，用于幂等。
+type HandoffRequest struct {
+	RequestID string
+	HandoffID string // 可选，为空则自动生成
+	FromTeam  string // 交出责任的值班班组
+	ToTeam    string // 接收责任的值班班组
+}
+
 // requestRecord 记录一个外部请求号对应的请求内容指纹与结果，用于幂等与冲突检测。
 type requestRecord struct {
-	Kind        string `json:"kind"`        // create_incident | acknowledge | resolve
+	Kind        string `json:"kind"`        // create_incident | acknowledge | resolve | handoff
 	Fingerprint string `json:"fingerprint"` // 请求内容指纹
-	IncidentID  string `json:"incident_id"` // 幂等重放时定位结果
+	ResultID    string `json:"result_id"`   // 幂等重放时定位结果（事件 ID 或交接 ID）
 }
 
 // timerRecord 是 Timer 的持久化形态（当前同构，独立命名以便演进）。
@@ -68,6 +78,7 @@ type timerRecord = Timer
 type snapshot struct {
 	Policies     map[string]*Policy       `json:"policies"`
 	Incidents    map[string]*Incident     `json:"incidents"`
+	Handoffs     map[string]*Handoff      `json:"handoffs"`
 	Outbox       []*OutboxItem            `json:"outbox"`
 	NextOutboxID int64                    `json:"next_outbox_id"`
 	Timers       map[string]*timerRecord  `json:"timers"`       // incidentID -> 唯一定时器
@@ -81,6 +92,7 @@ func newSnapshot() *snapshot {
 	return &snapshot{
 		Policies:    map[string]*Policy{},
 		Incidents:   map[string]*Incident{},
+		Handoffs:    map[string]*Handoff{},
 		Timers:      map[string]*timerRecord{},
 		SentIntents: map[string]struct{}{},
 		Requests:    map[string]requestRecord{},
@@ -131,6 +143,9 @@ func (snap *snapshot) afterLoad() {
 	if snap.Incidents == nil {
 		snap.Incidents = map[string]*Incident{}
 	}
+	if snap.Handoffs == nil {
+		snap.Handoffs = map[string]*Handoff{}
+	}
 	if snap.Timers == nil {
 		snap.Timers = map[string]*timerRecord{}
 	}
@@ -139,6 +154,12 @@ func (snap *snapshot) afterLoad() {
 	}
 	if snap.Requests == nil {
 		snap.Requests = map[string]requestRecord{}
+	}
+	// 兼容旧版本：升级通知意图缺失 Kind 字段时补默认值。
+	for _, item := range snap.Outbox {
+		if item.Kind == "" {
+			item.Kind = KindEscalation
+		}
 	}
 }
 
@@ -197,7 +218,7 @@ func fingerprint(v any) string {
 }
 
 // checkRequest 实现“按外部请求号幂等；同号异内容冲突”。
-// 命中同内容请求时返回已记录的 incidentID（重放）；同号异内容返回 ErrConflict。
+// 命中同内容请求时返回已记录的结果 ID（重放）；同号异内容返回 ErrConflict。
 func (s *Store) checkRequestLocked(kind, requestID string, content any) (string, bool, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return "", false, fmt.Errorf("%w: request id is required", ErrInvalidArgument)
@@ -210,14 +231,14 @@ func (s *Store) checkRequestLocked(kind, requestID string, content any) (string,
 	if rec.Kind != kind || rec.Fingerprint != fp {
 		return "", false, fmt.Errorf("%w: request id %q reused with different payload", ErrConflict, requestID)
 	}
-	return rec.IncidentID, true, nil
+	return rec.ResultID, true, nil
 }
 
-func (s *Store) rememberRequestLocked(kind, requestID, incidentID string, content any) {
+func (s *Store) rememberRequestLocked(kind, requestID, resultID string, content any) {
 	s.snap.Requests[requestID] = requestRecord{
 		Kind:        kind,
 		Fingerprint: fingerprint(content),
-		IncidentID:  incidentID,
+		ResultID:    resultID,
 	}
 }
 
@@ -238,8 +259,10 @@ func cloneSteps(in []Step) []Step {
 	return out
 }
 
-func intentKey(incidentID string, stepIndex int, target string) string {
-	return fmt.Sprintf("%s\x00%d\x00%s", incidentID, stepIndex, target)
+// intentKey 是通知意图的全局去重键。kind 区分升级通知与交接通知，
+// 因此一次交接通知不会与同事件、同目标的升级通知互相顶掉。
+func intentKey(kind NotificationKind, incidentID string, stepIndex int, target string) string {
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%s", kind, incidentID, stepIndex, target)
 }
 
 // ---------- 策略配置 ----------
@@ -393,16 +416,17 @@ func (s *Store) CreateIncident(req CreateIncidentRequest, now time.Time) (*Incid
 	}
 
 	inc := &Incident{
-		ID:          id,
-		PolicyID:    req.PolicyID,
-		Severity:    req.Severity,
-		Detail:      req.Detail,
-		Status:      StatusFiring,
-		FrozenSteps: cloneSteps(p.Steps), // 冻结：之后策略如何改都与本事件无关
-		StartedAt:   now,
-		FiredAt:     make([]time.Time, len(p.Steps)),
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:           id,
+		PolicyID:     req.PolicyID,
+		Severity:     req.Severity,
+		Detail:       req.Detail,
+		Status:       StatusFiring,
+		AssignedTeam: req.AssignedTeam,
+		FrozenSteps:  cloneSteps(p.Steps), // 冻结：之后策略如何改都与本事件无关
+		StartedAt:    now,
+		FiredAt:      make([]time.Time, len(p.Steps)),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	s.snap.Incidents[id] = inc
 	// 第 0 步定时器与事件在同一次原子写入中持久化。
@@ -495,6 +519,154 @@ func (s *Store) Resolve(req ResolveRequest, now time.Time) (*Incident, error) {
 	return s.getIncidentLocked(inc.ID)
 }
 
+// ---------- 值班交接 ----------
+
+// Handoff 在班次切换时把未解决事件的处理责任从 FromTeam 移交给 ToTeam。
+// 整个交接在同一把锁、同一次原子落盘中完成，与确认/解决/计时推进互斥，
+// 因此这些操作并发时最终只会形成一个结果：
+//
+//   - 交接生效瞬间“冻结待移交清单”：只有当时仍处于 firing 且责任班组为
+//     FromTeam 的事件进入清单；已确认或已解决的事件不再移交（其责任班组不变）。
+//   - 已发出的通知（outbox 中已 delivered）保留原记录、原投递责任方，不改写；
+//     尚未派发的 pending 通知原子转交给 ToTeam——交接提交后一条意图只有一个
+//     持久化投递责任方，旧班组不会再开始新的派发。交接边界上已被旧班组取走、
+//     尚未标记 delivered 的在途意图仍按既有 at-least-once 语义可能重投一次，
+//     由下游按 OutboxItem.ID 幂等兜底（与崩溃重投同源）。
+//   - 为每个移交事件产生一条发给 ToTeam 的交接通知（去重键
+//     (handoff 通知, 事件, 新班组)），保证新班组一定接得住手；
+//     升级定时器原样保留并继续按原计划到期，交接不会让升级停止或重放。
+//   - 同一 RequestID 的重复交接幂等返回原交接记录；重复交接不会再次更换
+//     负责人，也不会再次产生通知。
+func (s *Store) Handoff(req HandoffRequest, now time.Time) (*Handoff, error) {
+	if strings.TrimSpace(req.FromTeam) == "" || strings.TrimSpace(req.ToTeam) == "" {
+		return nil, fmt.Errorf("%w: handoff requires both from_team and to_team", ErrInvalidArgument)
+	}
+	if req.FromTeam == req.ToTeam {
+		return nil, fmt.Errorf("%w: handoff from_team and to_team must differ", ErrInvalidArgument)
+	}
+	content := struct {
+		HandoffID string `json:"handoff_id"`
+		FromTeam  string `json:"from_team"`
+		ToTeam    string `json:"to_team"`
+	}{req.HandoffID, req.FromTeam, req.ToTeam}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existingID, replay, err := s.checkRequestLocked("handoff", req.RequestID, content); err != nil {
+		return nil, err
+	} else if replay {
+		return s.getHandoffLocked(existingID)
+	}
+
+	id := req.HandoffID
+	if id == "" {
+		s.snap.NextSeq++
+		id = fmt.Sprintf("handoff-%d", s.snap.NextSeq)
+	}
+	if _, exists := s.snap.Handoffs[id]; exists {
+		return nil, fmt.Errorf("%w: handoff %q", ErrAlreadyExists, id)
+	}
+
+	// 1) 冻结待移交清单：仅当时 firing 且归属 FromTeam 的事件。
+	ids := make([]string, 0, len(s.snap.Incidents))
+	for incID := range s.snap.Incidents {
+		ids = append(ids, incID)
+	}
+	sort.Strings(ids)
+	frozen := make([]string, 0)
+	for _, incID := range ids {
+		inc := s.snap.Incidents[incID]
+		if inc.Status != StatusFiring || inc.AssignedTeam != req.FromTeam {
+			continue // 已确认/已解决，或本就不属于下班组：不移交
+		}
+		frozen = append(frozen, incID)
+	}
+
+	h := &Handoff{ID: id, FromTeam: req.FromTeam, ToTeam: req.ToTeam, IncidentIDs: frozen, CreatedAt: now}
+	s.snap.Handoffs[id] = h
+
+	// 2) 逐事件衔接责任：换负责人、转交 pending 意图、产生交接通知。
+	for _, incID := range frozen {
+		inc := s.snap.Incidents[incID]
+
+		// pending 的升级/交接通知转由新班组继续投递；已投递记录原样保留。
+		for _, item := range s.snap.Outbox {
+			if item.IncidentID == incID && item.Status == OutboxPending {
+				item.OwnerTeam = req.ToTeam
+			}
+		}
+
+		// 发给新班组的交接通知（与升级通知使用不同去重域，绝不顶替）。
+		key := intentKey(KindHandoff, incID, -1, req.ToTeam)
+		if _, dup := s.snap.SentIntents[key]; !dup {
+			s.snap.SentIntents[key] = struct{}{}
+			s.snap.NextOutboxID++
+			s.snap.Outbox = append(s.snap.Outbox, &OutboxItem{
+				ID:         s.snap.NextOutboxID,
+				IncidentID: incID,
+				Kind:       KindHandoff,
+				StepIndex:  -1,
+				Target:     req.ToTeam,
+				Channel:    "default",
+				Message: fmt.Sprintf("[handoff %s] incident %s handed over from %s to %s: %s",
+					id, incID, req.FromTeam, req.ToTeam, inc.Detail),
+				Status:    OutboxPending,
+				OwnerTeam: req.ToTeam,
+				CreatedAt: now,
+			})
+		}
+
+		// 更换负责人并留下交接轨迹；定时器不动，升级继续。
+		inc.AssignedTeam = req.ToTeam
+		inc.Handoffs = append(inc.Handoffs, HandoffRecord{
+			HandoffID: id, FromTeam: req.FromTeam, ToTeam: req.ToTeam, At: now,
+		})
+		inc.UpdatedAt = now
+		s.appendHistoryLocked(incID, "handed_off",
+			fmt.Sprintf("handoff=%s from=%s to=%s", id, req.FromTeam, req.ToTeam), now)
+	}
+
+	s.rememberRequestLocked("handoff", req.RequestID, id, content)
+	if err := s.commitLocked(); err != nil {
+		return nil, err
+	}
+	return cloneHandoff(h), nil
+}
+
+// GetHandoff 读取一次交接记录（含冻结的待移交清单）。
+func (s *Store) GetHandoff(id string) (*Handoff, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getHandoffLocked(id)
+}
+
+func (s *Store) getHandoffLocked(id string) (*Handoff, error) {
+	h, ok := s.snap.Handoffs[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: handoff %q", ErrNotFound, id)
+	}
+	return cloneHandoff(h), nil
+}
+
+// ListHandoffs 列出全部交接记录，按创建时间（ID 写入顺序）排序。
+func (s *Store) ListHandoffs() []*Handoff {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Handoff, 0, len(s.snap.Handoffs))
+	for _, h := range s.snap.Handoffs {
+		out = append(out, cloneHandoff(h))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+func cloneHandoff(h *Handoff) *Handoff {
+	cp := *h
+	cp.IncidentIDs = append([]string(nil), h.IncidentIDs...)
+	return &cp
+}
+
 // GetIncident 读取事件。
 func (s *Store) GetIncident(id string) (*Incident, error) {
 	s.mu.Lock()
@@ -526,6 +698,9 @@ func cloneIncident(in *Incident) *Incident {
 	cp := *in
 	cp.FrozenSteps = cloneSteps(in.FrozenSteps)
 	cp.FiredAt = append([]time.Time(nil), in.FiredAt...)
+	if in.Handoffs != nil {
+		cp.Handoffs = append([]HandoffRecord(nil), in.Handoffs...)
+	}
 	return &cp
 }
 
@@ -601,7 +776,7 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 		step := inc.FrozenSteps[idx]
 		var targets []string
 		for _, target := range step.Targets {
-			key := intentKey(id, idx, target)
+			key := intentKey(KindEscalation, id, idx, target)
 			if _, dup := s.snap.SentIntents[key]; dup {
 				continue // 同一事件、同一步骤、同一目标只有一次通知意图
 			}
@@ -610,12 +785,14 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 			s.snap.Outbox = append(s.snap.Outbox, &OutboxItem{
 				ID:         s.snap.NextOutboxID,
 				IncidentID: id,
+				Kind:       KindEscalation,
 				StepIndex:  idx,
 				Target:     target,
 				Channel:    "default",
 				Message: fmt.Sprintf("[incident %s] escalation step %d: %s",
 					id, idx, inc.Detail),
 				Status:    OutboxPending,
+				OwnerTeam: inc.AssignedTeam,
 				CreatedAt: now,
 			})
 			targets = append(targets, target)
@@ -657,6 +834,24 @@ func (s *Store) PendingOutbox() []*OutboxItem {
 	var out []*OutboxItem
 	for _, item := range s.snap.Outbox {
 		if item.Status == OutboxPending {
+			cp := *item
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// PendingOutboxForTeam 返回归属指定值班班组、尚未投递的通知意图，按 ID 排序。
+// Service 只代表自己的班组取件：交接把 pending 意图的 OwnerTeam 原子改写为
+// 新班组后，旧班组的扫描再也捞不到它，新班组接着投递——一条意图始终只有
+// 一个持久化意义上的投递责任方。team 为空时只返回无归属（旧数据）的意图。
+func (s *Store) PendingOutboxForTeam(team string) []*OutboxItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*OutboxItem
+	for _, item := range s.snap.Outbox {
+		if item.Status == OutboxPending && item.OwnerTeam == team {
 			cp := *item
 			out = append(out, &cp)
 		}

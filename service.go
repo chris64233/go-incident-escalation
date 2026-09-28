@@ -24,6 +24,11 @@ type Config struct {
 	TickInterval time.Duration
 	// DispatchInterval 是后台捞取 pending outbox 的间隔。默认 100ms。
 	DispatchInterval time.Duration
+	// Team 是本 Service 实例所代表的值班班组。派发循环只投递 OwnerTeam
+	// 等于 Team 的 pending 意图：值班交接把未投递意图的 OwnerTeam 原子改写为
+	// 新班组后，旧班组实例不再派发它，新班组实例接着派发，避免双方重复通知。
+	// 为空时只投递没有归属班组的意图（例如未使用班组概念时创建的事件）。
+	Team string
 	// Now 可注入时钟（测试用）；为 nil 时用 time.Now。
 	Now func() time.Time
 }
@@ -34,6 +39,7 @@ type Service struct {
 	store      *Store
 	dispatcher Dispatcher
 	cfg        Config
+	team       string
 
 	mu              sync.Mutex
 	stop            chan struct{}
@@ -55,7 +61,7 @@ func NewService(store *Store, dispatcher Dispatcher, cfg Config) *Service {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Service{store: store, dispatcher: dispatcher, cfg: cfg}
+	return &Service{store: store, dispatcher: dispatcher, cfg: cfg, team: cfg.Team}
 }
 
 // Start 启动后台循环。重复 Start 返回已在运行的同一实例，不另起 goroutine。
@@ -128,9 +134,12 @@ func (svc *Service) runDispatch(stop, stopped chan struct{}) {
 }
 
 func (svc *Service) drainOutbox() {
-	for _, item := range svc.store.PendingOutbox() {
+	// 只取归属本班组的意图：交接改写 OwnerTeam 后，旧班组立即停止派发，
+	// 新班组无缝接手，同一条 pending 意图不会被两个班组同时通知。
+	for _, item := range svc.store.PendingOutboxForTeam(svc.team) {
 		if err := svc.dispatcher.Dispatch(*item); err != nil {
-			// 投递失败：保留 pending，下轮重试；跳过本条，不阻塞其它意图。
+			// 投递失败：保留 pending（归属不变），下轮由同一责任方重试；
+			// 跳过本条，不阻塞其它意图。
 			continue
 		}
 		_ = svc.store.MarkDelivered(item.ID, svc.cfg.Now())
