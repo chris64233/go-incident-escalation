@@ -89,3 +89,84 @@ func Example() {
 	// 历史: step_fired
 	// 历史: acknowledged
 }
+
+// ExampleSuppression 展示维护窗口抑制：窗口内升级被暂缓（原因可查），
+// 期间级别变化持续记录，窗口结束后按最新级别补发未处理级别，
+// 已解决事件不会重新通知。
+func Example_suppressionWindow() {
+	store := incidentescalation.NewMemoryStore()
+	now := time.Unix(1_700_000_000, 0)
+
+	_, _ = store.CreatePolicy(incidentescalation.PolicyInput{
+		ID:   "p",
+		Name: "标准升级",
+		Steps: []incidentescalation.Step{
+			{WaitBefore: 0, Targets: []string{"oncall-l1"}},
+			{WaitBefore: 30 * time.Minute, Targets: []string{"oncall-l2"}},
+		},
+	}, now)
+
+	inc, err := store.CreateIncident(incidentescalation.CreateIncidentRequest{
+		RequestID: "inc-1", IncidentID: "inc-1", PolicyID: "p",
+		Severity: "warning", Detail: "复制延迟过高", OwnerGroup: "night-shift",
+	}, now)
+	if err != nil {
+		panic(err)
+	}
+
+	// 交班后开一个 2 小时维护窗口，只抑制这起事件的升级。
+	rule, err := store.CreateSuppression(incidentescalation.CreateSuppressionRequest{
+		RequestID:  "mw-req-1",
+		RuleID:     "mw-db-reindex",
+		Scope:      incidentescalation.SuppressionScope{IncidentIDs: []string{inc.ID}},
+		Reason:     "凌晨数据库索引重建",
+		ValidFrom:  now,
+		ValidUntil: now.Add(2 * time.Hour),
+	}, now)
+	if err != nil {
+		panic(err)
+	}
+
+	// 窗口内两步升级都到期：步骤照常触发，但通知意图全部 held，不派发。
+	_, _ = store.ProcessDue(now.Add(time.Hour))
+	_, _ = store.ProcessDue(now.Add(90 * time.Minute))
+	if pending := store.PendingOutbox(); len(pending) != 0 {
+		panic("suppressed escalations must not be dispatched")
+	}
+
+	// 内容相同（范围 + 原因）但解除时间不同：明确拒绝，不静默延长或覆盖原窗口。
+	_, dupErr := store.CreateSuppression(incidentescalation.CreateSuppressionRequest{
+		RequestID: "mw-req-dup", RuleID: "mw-db-reindex-longer",
+		Scope:     incidentescalation.SuppressionScope{IncidentIDs: []string{inc.ID}},
+		Reason:    "凌晨数据库索引重建",
+		ValidFrom: now, ValidUntil: now.Add(4 * time.Hour),
+	}, now.Add(time.Minute))
+	fmt.Println("重复规则被拒绝:", dupErr != nil)
+
+	// 抑制期间事件级别变化：持续记录、可查询。
+	_, _ = store.UpdateSeverity(incidentescalation.UpdateSeverityRequest{
+		RequestID: "sev-1", IncidentID: inc.ID, Severity: "critical",
+		Reason: "业务高峰期延迟影响扩大", UpdatedBy: "night-shift",
+	}, now.Add(75*time.Minute))
+
+	// 维护窗口结束后的扫描：自动解除，按最新级别补发暂缓的升级。
+	_, _ = store.ProcessDue(now.Add(3 * time.Hour))
+	for _, item := range store.PendingOutbox() {
+		fmt.Printf("补发通知: step=%d target=%s kind=%s\n",
+			item.StepIndex, item.Target, item.Kind)
+	}
+
+	// 查询视图：事件、每一级升级与抑制原因、级别轨迹、当时是否还在窗口内。
+	view, err := store.GetIncidentView(inc.ID, now.Add(3*time.Hour))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("最新级别:", view.Incident.Severity, "有效抑制规则数:", len(view.ActiveSuppressions))
+	_ = rule
+
+	// Output:
+	// 重复规则被拒绝: true
+	// 补发通知: step=0 target=oncall-l1 kind=suppression_resume
+	// 补发通知: step=1 target=oncall-l2 kind=suppression_resume
+	// 最新级别: critical 有效抑制规则数: 0
+}
