@@ -66,24 +66,26 @@ type timerRecord = Timer
 
 // snapshot 是一次性原子落盘的完整状态：事件状态、定时器、outbox 同生共死。
 type snapshot struct {
-	Policies     map[string]*Policy       `json:"policies"`
-	Incidents    map[string]*Incident     `json:"incidents"`
-	Outbox       []*OutboxItem            `json:"outbox"`
-	NextOutboxID int64                    `json:"next_outbox_id"`
-	Timers       map[string]*timerRecord  `json:"timers"`       // incidentID -> 唯一定时器
-	SentIntents  map[string]struct{}      `json:"sent_intents"` // "incidentID\x00step\x00target" 去重
-	Requests     map[string]requestRecord `json:"requests"`
-	History      []HistoryEntry           `json:"history"`
-	NextSeq      int64                    `json:"next_seq"`
+	Policies     map[string]*Policy          `json:"policies"`
+	Incidents    map[string]*Incident        `json:"incidents"`
+	Outbox       []*OutboxItem               `json:"outbox"`
+	NextOutboxID int64                       `json:"next_outbox_id"`
+	Timers       map[string]*timerRecord     `json:"timers"`       // incidentID -> 唯一定时器
+	SentIntents  map[string]struct{}         `json:"sent_intents"` // "incidentID\x00step\x00target" 去重
+	Requests     map[string]requestRecord    `json:"requests"`
+	Suppressions map[string]*SuppressionRule `json:"suppressions"` // ruleID -> 抑制规则
+	History      []HistoryEntry              `json:"history"`
+	NextSeq      int64                       `json:"next_seq"`
 }
 
 func newSnapshot() *snapshot {
 	return &snapshot{
-		Policies:    map[string]*Policy{},
-		Incidents:   map[string]*Incident{},
-		Timers:      map[string]*timerRecord{},
-		SentIntents: map[string]struct{}{},
-		Requests:    map[string]requestRecord{},
+		Policies:     map[string]*Policy{},
+		Incidents:    map[string]*Incident{},
+		Timers:       map[string]*timerRecord{},
+		SentIntents:  map[string]struct{}{},
+		Requests:     map[string]requestRecord{},
+		Suppressions: map[string]*SuppressionRule{},
 	}
 }
 
@@ -139,6 +141,9 @@ func (snap *snapshot) afterLoad() {
 	}
 	if snap.Requests == nil {
 		snap.Requests = map[string]requestRecord{}
+	}
+	if snap.Suppressions == nil {
+		snap.Suppressions = map[string]*SuppressionRule{}
 	}
 }
 
@@ -526,6 +531,9 @@ func cloneIncident(in *Incident) *Incident {
 	cp := *in
 	cp.FrozenSteps = cloneSteps(in.FrozenSteps)
 	cp.FiredAt = append([]time.Time(nil), in.FiredAt...)
+	cp.Handovers = append([]HandoverRecord(nil), in.Handovers...)
+	cp.SeverityHistory = append([]SeverityChange(nil), in.SeverityHistory...)
+	cp.SuppressedSteps = append([]SuppressedStep(nil), in.SuppressedSteps...)
 	return &cp
 }
 
@@ -567,6 +575,10 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 先处理窗口到期自动解除（可能在解除时补发通知）：
+	// 这样解除抑制与步骤触发同刻到达时，同一次扫描内按“解除后的最新规则”决策。
+	changed := s.autoReleaseDueLocked(now)
+
 	// 固定处理顺序，使行为与历史可预测。
 	ids := make([]string, 0, len(s.snap.Timers))
 	for id := range s.snap.Timers {
@@ -598,34 +610,31 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 			continue
 		}
 
-		step := inc.FrozenSteps[idx]
-		var targets []string
-		for _, target := range step.Targets {
-			key := intentKey(id, idx, target)
-			if _, dup := s.snap.SentIntents[key]; dup {
-				continue // 同一事件、同一步骤、同一目标只有一次通知意图
-			}
-			s.snap.SentIntents[key] = struct{}{}
-			s.snap.NextOutboxID++
-			s.snap.Outbox = append(s.snap.Outbox, &OutboxItem{
-				ID:         s.snap.NextOutboxID,
-				IncidentID: id,
-				StepIndex:  idx,
-				Target:     target,
-				Channel:    "default",
-				Message: fmt.Sprintf("[incident %s] escalation step %d: %s",
-					id, idx, inc.Detail),
-				Status:    OutboxPending,
-				CreatedAt: now,
-			})
-			targets = append(targets, target)
-		}
-
 		inc.FiredAt[idx] = now
 		inc.NextStepIndex = idx + 1
 		inc.UpdatedAt = now
-		s.appendHistoryLocked(id, "step_fired",
-			fmt.Sprintf("step=%d targets=%s", idx, strings.Join(targets, ",")), now)
+
+		// 抑制窗口内：升级照常推进（级别变化持续可见），但不产生通知，
+		// 记录抑制原因，等解除抑制时按事件最新状态补发。
+		var targets []string
+		if rule := s.activeSuppressionLocked(inc, now); rule != nil {
+			inc.SuppressedSteps = append(inc.SuppressedSteps, SuppressedStep{
+				StepIndex: idx,
+				FiredAt:   now,
+				RuleID:    rule.ID,
+				Reason:    rule.Reason,
+			})
+			s.appendHistoryLocked(id, "step_suppressed",
+				fmt.Sprintf("step=%d rule=%s reason=%s", idx, rule.ID, rule.Reason), now)
+		} else {
+			for _, target := range inc.FrozenSteps[idx].Targets {
+				if s.emitIntentLocked(inc, idx, target, now, false) {
+					targets = append(targets, target)
+				}
+			}
+			s.appendHistoryLocked(id, "step_fired",
+				fmt.Sprintf("step=%d targets=%s", idx, strings.Join(targets, ",")), now)
+		}
 
 		// 推进一步后立即重新登记下一步定时器（基于实际触发时间等待），
 		// 或在最后一步后清除定时器。
@@ -640,12 +649,43 @@ func (s *Store) ProcessDue(now time.Time) (int, error) {
 		}
 		advanced++
 	}
-	if advanced > 0 {
+	if advanced > 0 || changed {
 		if err := s.commitLocked(); err != nil {
 			return 0, err
 		}
 	}
 	return advanced, nil
+}
+
+// emitIntentLocked 形成一条通知意图并写入事务性 outbox。
+// 正常升级与解除抑制后的补发共用同一套 (事件,步骤,目标) 去重，
+// 因此每个级别的每个目标最多只有一次有效通知。
+// 返回是否真正写入了新意图。调用方必须持有 mu。
+func (s *Store) emitIntentLocked(inc *Incident, stepIndex int, target string, now time.Time, catchUp bool) bool {
+	key := intentKey(inc.ID, stepIndex, target)
+	if _, dup := s.snap.SentIntents[key]; dup {
+		return false
+	}
+	s.snap.SentIntents[key] = struct{}{}
+	s.snap.NextOutboxID++
+	message := fmt.Sprintf("[incident %s] escalation step %d: %s", inc.ID, stepIndex, inc.Detail)
+	if catchUp {
+		message = fmt.Sprintf("[incident %s] catch-up escalation step %d (after suppression): %s",
+			inc.ID, stepIndex, inc.Detail)
+	}
+	s.snap.Outbox = append(s.snap.Outbox, &OutboxItem{
+		ID:         s.snap.NextOutboxID,
+		IncidentID: inc.ID,
+		StepIndex:  stepIndex,
+		Target:     target,
+		Channel:    "default",
+		Message:    message,
+		Status:     OutboxPending,
+		Handler:    inc.CurrentHandler(),
+		CatchUp:    catchUp,
+		CreatedAt:  now,
+	})
+	return true
 }
 
 // ---------- Outbox ----------

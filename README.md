@@ -35,6 +35,33 @@
 - **按外部请求号幂等**：事件创建、确认、解决都必须带 `RequestID`。
   同号同内容重放返回原结果；同号异内容（或跨操作类型复用请求号）返回
   `ErrConflict`。幂等表同样持久化，重启后仍然生效。
+- **维护窗口抑制**：交接后可对一组事件创建抑制规则（`Store.CreateSuppression`），
+  规则包含三要素：
+  - 事件范围 `SuppressionScope`：按事件 ID / 级别 / 策略 ID 过滤，空范围覆盖全部事件；
+  - 有效时间：`StartsAt`–`EndsAt`；
+  - 解除条件：`ReleaseAtWindowEnd`（窗口结束自动解除，默认）或 `ReleaseManual`（仅手工解除）。
+
+  抑制期内升级**照常按冻结策略推进**，每一级的触发时间与抑制原因持续可查，但不产生通知；
+  规则解除（窗口到期自动解除或 `Store.ReleaseSuppression` 手工解除）时按事件**最新状态**
+  补发错过的级别，与正常通知共用 `(事件,级别,目标)` 去重——每个级别的每个目标最多一次
+  有效通知。已解决或已确认的事件不会因解除抑制再发通知；事件若在窗口内通过级别变化
+  离开了规则范围，其被抑制的级别仍会在解除时按最新级别处理。
+- **规则去重**：范围、原因、生效起点、解除条件相同的有效规则视为重复，创建返回
+  `ErrAlreadyExists`；**解除时间不同也不会静默延长或覆盖原窗口**，错误信息会带出
+  现有规则 ID。已解除的规则不再阻止同内容新规则创建。
+- **旧规则不能绕过当前规则**：多条规则叠加时，解除其中一条只会为“不再被任何有效
+  规则覆盖”的事件补发；仍被其它规则覆盖的事件继续抑制。窗口自动解除、手工解除、
+  步骤触发、交接都在同一把互斥锁内串行化，并发到达最终收敛为一个合法状态。
+- **值班交接**：`Store.Handover` 追加移交记录（移交人、接手人、时间、备注），不停止
+  升级；同一事件的**每一次交接都保留**。通知意图记录形成时的当前接手人
+  （`OutboxItem.Handler`），解除抑制补发时通知的是最新班次而非旧班次。
+- **级别变化**：`Store.ChangeSeverity` 随时可调整事件级别（抑制期间也可），变化历史
+  （`Incident.SeverityHistory`）与综合视图持续可见；解除抑制时按最新级别重新判断规则
+  范围与是否需要通知。
+- **综合查询视图**：`Store.IncidentViewAt(id, now)` / `Store.IncidentViewsAt(now)`
+  一次性返回事件本体、每一级升级状态（`notified` / `suppressed` / `caught_up` /
+  `pending`，含抑制原因与规则 ID）、完整交接链、级别变化历史以及覆盖该事件的全部
+  抑制规则及其当前是否生效。
 - **原子持久化**：采用“临时文件 + fsync + 原子 rename（+ 目录 fsync）”写整份快照，
   事件状态、定时器、outbox 要么全部生效、要么全部不生效。
 
@@ -46,6 +73,12 @@
 | 创建事件（冻结策略、登记定时器） | `Store.CreateIncident` |
 | 确认（停止升级） | `Store.Acknowledge` |
 | 解决（禁止确认与通知） | `Store.Resolve` |
+| 值班交接（保留每次接手人与时间） | `Store.Handover` |
+| 调整事件级别（抑制期间也可） | `Store.ChangeSeverity` |
+| 创建抑制规则（范围+窗口+解除条件） | `Store.CreateSuppression` |
+| 手工解除抑制（按最新状态补发） | `Store.ReleaseSuppression` |
+| 查询抑制规则 | `Store.GetSuppression` / `Store.ListSuppressions` |
+| 综合视图（事件/升级/交接/抑制原因） | `Store.IncidentViewAt` / `Store.IncidentViewsAt` |
 | 到期推进（后台循环或手工调用） | `Store.ProcessDue(now)` |
 | 查看定时器 | `Store.NextDue` / `Store.Timer` |
 | 通知 outbox | `Store.PendingOutbox` / `ListOutbox` / `MarkDelivered` |
@@ -64,6 +97,9 @@
 | `ErrAlreadyAcknowledged` | 新的确认请求到达时事件已确认 |
 | `ErrAlreadyResolved` | 新的解决请求到达时事件已解决 |
 | `ErrIncidentResolved` | 事件已解决后再确认（解决后也不再通知） |
+
+创建抑制规则返回 `ErrAlreadyExists` 表示已有同内容（范围/原因/起点/解除条件相同）
+的有效规则——即使解除时间不同也是此错误，原窗口保持不变。
 
 ## 使用示例
 
@@ -101,7 +137,43 @@ store.Acknowledge(incidentescalation.AckRequest{
 }, time.Now())
 ```
 
-更多端到端用法见 `example_test.go`。
+维护窗口内暂时抑制升级通知（窗口结束自动解除，并按事件最新状态补发错过的级别）：
+
+```go
+// 值班交接：每次移交人与时间都会保留。
+store.Handover(incidentescalation.HandoverRequest{
+    RequestID: "hand-001", IncidentID: inc.ID, From: "oncall-l1", To: "oncall-l2",
+}, time.Now())
+
+// 创建抑制规则：范围 + 窗口 + 解除条件。同内容规则重复创建会返回 ErrAlreadyExists，
+// 即使解除时间不同也不会延长原窗口。
+store.CreateSuppression(incidentescalation.SuppressionRequest{
+    RequestID: "sup-001",
+    SuppressionInput: incidentescalation.SuppressionInput{
+        Scope:     incidentescalation.SuppressionScope{Severities: []string{"critical"}},
+        Reason:    "数据库 02:00-03:00 维护窗口",
+        StartsAt:  time.Now(),
+        EndsAt:    time.Now().Add(time.Hour),
+        Condition: incidentescalation.ReleaseAtWindowEnd, // 或 ReleaseManual
+        CreatedBy: "oncall-l2",
+    },
+}, time.Now())
+
+// 需要提前结束窗口时手工解除（已解决/已确认事件不会被补发）。
+store.ReleaseSuppression(incidentescalation.ReleaseSuppressionRequest{
+    RequestID: "rel-001", RuleID: "sup-1", ReleasedBy: "oncall-l2",
+}, time.Now())
+
+// 综合查询：事件、每一级升级状态、交接链、级别变化与抑制原因一次查全。
+view, _ := store.IncidentViewAt(inc.ID, time.Now())
+for _, esc := range view.Escalations {
+    // esc.State: notified | suppressed | caught_up | pending
+    _ = esc
+}
+```
+
+更多端到端用法见 `example_test.go`（基础升级流程）与
+`example_suppression_test.go`（维护窗口抑制、交接与解除补发）。
 
 ## Outbox 投递语义
 
@@ -112,10 +184,11 @@ store.Acknowledge(incidentescalation.AckRequest{
 
 ## 持久化格式
 
-单个 JSON 快照文件，包含策略、事件（含冻结步骤与进度）、定时器表、outbox、
-通知意图去重集合、外部请求幂等表与历史。写入采用同目录临时文件 rename，
-崩溃时只会保留上一份完整文件，不会出现半截状态。需要更强扩展性时，
-可将 `Store` 内部替换为带事务的数据库实现，领域语义（同锁内推进 + 意图去重）不变。
+单个 JSON 快照文件，包含策略、事件（含冻结步骤、进度、交接链、级别变化与抑制步骤）、
+抑制规则表、定时器表、outbox（含接手人与补发标记）、通知意图去重集合、外部请求幂等表
+与历史。写入采用同目录临时文件 rename，崩溃时只会保留上一份完整文件，不会出现半截状态。
+需要更强扩展性时，可将 `Store` 内部替换为带事务的数据库实现，领域语义
+（同锁内推进 + 意图去重 + 解除时按最新状态补发）不变。
 
 ## 测试覆盖
 
@@ -129,3 +202,17 @@ store.Acknowledge(incidentescalation.AckRequest{
 - 同请求号并发创建只产生一个事件；
 - 落盘后重新 `OpenStore`：定时器、outbox、事件进度、幂等表全部恢复并继续推进；
 - 后台 `Service` 循环按序投递、投递失败重试、确认后后续步骤不再触发。
+- 维护窗口抑制：
+  - 规则校验（窗口/原因/解除条件/范围内事件存在性）与按请求号幂等；
+  - 同内容规则（含仅解除时间不同）报 `ErrAlreadyExists` 且原窗口不变，
+    已解除规则不再阻止新规则；
+  - 抑制期内每级照推进、零通知，视图持续展示级别与抑制原因；
+  - 手工解除 / 窗口结束自动解除按最新状态补发，每级每目标恰好一次，
+    补发意图带当前接手人且标记 `CatchUp`；
+  - 已解决 / 已确认事件解除抑制不补发；窗口内级别变化离开范围后仍按最新级别处理；
+  - 多条规则叠加时旧规则解除不能绕过仍有效的当前规则；
+  - 交接链完整保留、通知意图按形成时接手人打标；级别变化历史与综合视图可见；
+  - 16 路 goroutine 并发“升级触发 + 交接 + 解除抑制”收敛：每级最多一次意图、
+    解除历史恰好一条；
+  - 抑制状态、抑制步骤、交接记录落盘后重启恢复，窗口结束后自动补发并继续升级；
+  - 后台 `Service` 在窗口结束后自动解除规则并补发投递。
