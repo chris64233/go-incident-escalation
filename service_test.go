@@ -77,7 +77,8 @@ func TestServiceDispatcherRetryThenAckStops(t *testing.T) {
 		ID: "p", Name: "p",
 		Steps: []Step{
 			{WaitBefore: 10 * time.Millisecond, Targets: []string{"alice"}},
-			{WaitBefore: 10 * time.Millisecond, Targets: []string{"bob"}},
+			// step1 等待足够长，保证测试期间只有 step0 的意图。
+			{WaitBefore: time.Hour, Targets: []string{"bob"}},
 		},
 	}, base); err != nil {
 		t.Fatal(err)
@@ -85,7 +86,12 @@ func TestServiceDispatcherRetryThenAckStops(t *testing.T) {
 	inc, _ := s.CreateIncident(CreateIncidentRequest{RequestID: "r1", PolicyID: "p"}, base)
 
 	disp := &recordingDispatcher{failing: map[string]bool{"alice": true}}
-	svc := NewService(s, disp, Config{TickInterval: 5 * time.Millisecond, DispatchInterval: 5 * time.Millisecond})
+	svc := NewService(s, disp, Config{
+		TickInterval:     5 * time.Millisecond,
+		DispatchInterval: 5 * time.Millisecond,
+		// 提高重试上限，避免故障修复前达到上限进入 failed 终态。
+		RetryPolicy: RetryPolicy{MaxAttempts: 1000, ReceiptTimeout: time.Hour},
+	})
 	svc.Start()
 
 	// 等到 step0 意图产生并进入重试。
@@ -97,6 +103,12 @@ func TestServiceDispatcherRetryThenAckStops(t *testing.T) {
 	disp.mu.Lock()
 	disp.failing = map[string]bool{}
 	disp.mu.Unlock()
+
+	// 等 alice 重试成功（确认后未完成的投递会被停止，不再重试）。
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(disp.delivered()) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	// 确认事件：step1 永不触发，只有 alice 一条意图。
 	if _, err := s.Acknowledge(AckRequest{RequestID: "a1", IncidentID: inc.ID, AcknowledgedBy: "oncall"}, time.Now()); err != nil {

@@ -61,6 +61,16 @@ type requestRecord struct {
 	IncidentID  string `json:"incident_id"` // 幂等重放时定位结果
 }
 
+// receiptRecord 记录一条已处理渠道回执的指纹与处理结果，用于幂等重放与冲突检测。
+type receiptRecord struct {
+	Fingerprint string         `json:"fingerprint"`
+	Applied     bool           `json:"applied"`
+	Status      DeliveryStatus `json:"status"`
+	Reason      string         `json:"reason"`
+	// ErrKind 记录首次处理返回的哨兵错误类别（"" 或 "stale"），重放时原样返回。
+	ErrKind string `json:"err_kind,omitempty"`
+}
+
 // timerRecord 是 Timer 的持久化形态（当前同构，独立命名以便演进）。
 type timerRecord = Timer
 
@@ -73,6 +83,8 @@ type snapshot struct {
 	Timers       map[string]*timerRecord  `json:"timers"`       // incidentID -> 唯一定时器
 	SentIntents  map[string]struct{}      `json:"sent_intents"` // "incidentID\x00step\x00target" 去重
 	Requests     map[string]requestRecord `json:"requests"`
+	Receipts     map[string]receiptRecord `json:"receipts"` // receiptID -> 处理结果
+	RetryPolicy  RetryPolicy              `json:"retry_policy"`
 	History      []HistoryEntry           `json:"history"`
 	NextSeq      int64                    `json:"next_seq"`
 }
@@ -84,6 +96,8 @@ func newSnapshot() *snapshot {
 		Timers:      map[string]*timerRecord{},
 		SentIntents: map[string]struct{}{},
 		Requests:    map[string]requestRecord{},
+		Receipts:    map[string]receiptRecord{},
+		RetryPolicy: RetryPolicy{}.normalized(),
 	}
 }
 
@@ -140,6 +154,10 @@ func (snap *snapshot) afterLoad() {
 	if snap.Requests == nil {
 		snap.Requests = map[string]requestRecord{}
 	}
+	if snap.Receipts == nil {
+		snap.Receipts = map[string]receiptRecord{}
+	}
+	snap.RetryPolicy = snap.RetryPolicy.normalized()
 }
 
 // persistLocked 将当前快照原子写入磁盘；调用方必须持有 mu。
@@ -450,6 +468,7 @@ func (s *Store) Acknowledge(req AckRequest, now time.Time) (*Incident, error) {
 	inc.AcknowledgedBy = req.AcknowledgedBy
 	inc.UpdatedAt = now
 	delete(s.snap.Timers, inc.ID) // 状态与定时器删除原子落盘
+	s.stopDeliveriesLocked(inc.ID, "incident_acknowledged", now)
 	s.appendHistoryLocked(inc.ID, "acknowledged", "by="+req.AcknowledgedBy, now)
 	s.rememberRequestLocked("acknowledge", req.RequestID, inc.ID, content)
 	if err := s.commitLocked(); err != nil {
@@ -487,6 +506,7 @@ func (s *Store) Resolve(req ResolveRequest, now time.Time) (*Incident, error) {
 	inc.ResolvedBy = req.ResolvedBy
 	inc.UpdatedAt = now
 	delete(s.snap.Timers, inc.ID)
+	s.stopDeliveriesLocked(inc.ID, "incident_resolved", now)
 	s.appendHistoryLocked(inc.ID, "resolved", "by="+req.ResolvedBy, now)
 	s.rememberRequestLocked("resolve", req.RequestID, inc.ID, content)
 	if err := s.commitLocked(); err != nil {
@@ -680,23 +700,330 @@ func (s *Store) ListOutbox(incidentID string) []*OutboxItem {
 	return out
 }
 
-// MarkDelivered 将一条 outbox 意图标记为已投递。
+// MarkDelivered 将一条 outbox 意图标记为渠道已确认接收（等同收到 accepted 回执）。
 // 投递与状态落盘是分离的：崩溃会导致重投（at-least-once），
 // 通知渠道应以 item.ID / (事件,步骤,目标) 做幂等。
 func (s *Store) MarkDelivered(id int64, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	item := s.findOutboxLocked(id)
+	if item == nil {
+		return fmt.Errorf("%w: outbox item %d", ErrNotFound, id)
+	}
+	switch item.Status {
+	case DeliveryAcknowledged:
+		return nil
+	case DeliveryFailed, DeliveryStopped:
+		return fmt.Errorf("%w: outbox item %d is %s", ErrDeliveryClosed, id, item.Status)
+	}
+	item.Status = DeliveryAcknowledged
+	item.AckedAt = now
+	item.NextAttemptAt = time.Time{}
+	s.appendHistoryLocked(item.IncidentID, "delivery_acknowledged",
+		fmt.Sprintf("step=%d target=%s source=mark_delivered", item.StepIndex, item.Target), now)
+	return s.commitLocked()
+}
+
+func (s *Store) findOutboxLocked(id int64) *OutboxItem {
 	for _, item := range s.snap.Outbox {
 		if item.ID == id {
-			if item.Status == OutboxPending {
-				item.Status = OutboxDelivered
-				item.DeliveredAt = now
-				return s.commitLocked()
-			}
-			return nil
+			return item
 		}
 	}
-	return fmt.Errorf("%w: outbox item %d", ErrNotFound, id)
+	return nil
+}
+
+func (s *Store) findIntentLocked(incidentID string, stepIndex int, target string) *OutboxItem {
+	for _, item := range s.snap.Outbox {
+		if item.IncidentID == incidentID && item.StepIndex == stepIndex && item.Target == target {
+			return item
+		}
+	}
+	return nil
+}
+
+// stopDeliveriesLocked 把事件所有未完成的投递（pending/dispatched）置为 stopped，
+// 并记录停止原因；与事件状态变更在同一次原子写入中落盘。调用方必须持有 mu。
+func (s *Store) stopDeliveriesLocked(incidentID, reason string, now time.Time) {
+	for _, item := range s.snap.Outbox {
+		if item.IncidentID != incidentID {
+			continue
+		}
+		if item.Status != DeliveryPending && item.Status != DeliveryDispatched {
+			continue
+		}
+		item.Status = DeliveryStopped
+		item.StopReason = reason
+		item.NextAttemptAt = time.Time{}
+		s.appendHistoryLocked(incidentID, "delivery_stopped",
+			fmt.Sprintf("step=%d target=%s reason=%s", item.StepIndex, item.Target, reason), now)
+	}
+}
+
+// ---------- 投递状态机 ----------
+
+// SetRetryPolicy 设置投递重试策略（持久化，重启后仍然生效）。零值字段取默认值。
+func (s *Store) SetRetryPolicy(rp RetryPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.RetryPolicy = rp.normalized()
+	return s.commitLocked()
+}
+
+// RetryPolicyOf 返回当前生效的重试策略。
+func (s *Store) RetryPolicyOf() RetryPolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snap.RetryPolicy
+}
+
+// DueOutbox 返回当前可（重）试的意图：状态为 pending 且已到 NextAttemptAt。
+// 重启后待重试意图由此恢复处理。
+func (s *Store) DueOutbox(now time.Time) []*OutboxItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*OutboxItem
+	for _, item := range s.snap.Outbox {
+		if item.Status != DeliveryPending {
+			continue
+		}
+		if !item.NextAttemptAt.IsZero() && item.NextAttemptAt.After(now) {
+			continue // 退避中，还未到重试时间
+		}
+		cp := *item
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// MarkDispatched 记录一次成功交给渠道的尝试：
+// 尝试次数与意图版本递增，状态变为 dispatched（等待渠道回执）。
+func (s *Store) MarkDispatched(id int64, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.findOutboxLocked(id)
+	if item == nil {
+		return fmt.Errorf("%w: outbox item %d", ErrNotFound, id)
+	}
+	if item.Status != DeliveryPending {
+		return fmt.Errorf("%w: outbox item %d is %s", ErrDeliveryClosed, id, item.Status)
+	}
+	item.Attempts++
+	item.Version++
+	item.LastAttemptAt = now
+	item.NextAttemptAt = time.Time{}
+	item.Status = DeliveryDispatched
+	s.appendHistoryLocked(item.IncidentID, "delivery_dispatched",
+		fmt.Sprintf("step=%d target=%s attempt=%d version=%d",
+			item.StepIndex, item.Target, item.Attempts, item.Version), now)
+	return s.commitLocked()
+}
+
+// MarkAttemptFailed 记录一次失败的投递尝试（渠道调用本身失败）。
+// 达到重试上限则进入 failed 终态，否则按退避策略安排下次重试。
+func (s *Store) MarkAttemptFailed(id int64, cause string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.findOutboxLocked(id)
+	if item == nil {
+		return fmt.Errorf("%w: outbox item %d", ErrNotFound, id)
+	}
+	if item.Status != DeliveryPending && item.Status != DeliveryDispatched {
+		return fmt.Errorf("%w: outbox item %d is %s", ErrDeliveryClosed, id, item.Status)
+	}
+	item.Attempts++
+	item.LastError = cause
+	item.LastAttemptAt = now
+	s.scheduleRetryOrFailLocked(item, "dispatch_error", now)
+	return s.commitLocked()
+}
+
+// scheduleRetryOrFailLocked 在一次失败（尝试失败/回执失败/回执超时）后
+// 决定是安排重试还是进入 failed 终态；追加带原因的历史。调用方必须持有 mu。
+func (s *Store) scheduleRetryOrFailLocked(item *OutboxItem, reason string, now time.Time) {
+	rp := s.snap.RetryPolicy
+	if item.Attempts >= rp.MaxAttempts {
+		item.Status = DeliveryFailed
+		item.NextAttemptAt = time.Time{}
+		s.appendHistoryLocked(item.IncidentID, "delivery_failed",
+			fmt.Sprintf("step=%d target=%s attempts=%d reason=%s error=%s",
+				item.StepIndex, item.Target, item.Attempts, reason, item.LastError), now)
+		return
+	}
+	item.Status = DeliveryPending
+	item.NextAttemptAt = now.Add(rp.Backoff)
+	s.appendHistoryLocked(item.IncidentID, "delivery_retry_scheduled",
+		fmt.Sprintf("step=%d target=%s attempt=%d reason=%s next_at=%s error=%s",
+			item.StepIndex, item.Target, item.Attempts, reason,
+			item.NextAttemptAt.Format(time.RFC3339), item.LastError), now)
+}
+
+// RequeueTimedOutDispatches 把等待回执超时的 dispatched 意图重新入队（或置为失败）。
+// 返回重新入队/置失败的条数。重启后同样适用：超时判断完全基于持久化的时间戳。
+func (s *Store) RequeueTimedOutDispatches(now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rp := s.snap.RetryPolicy
+	n := 0
+	for _, item := range s.snap.Outbox {
+		if item.Status != DeliveryDispatched || item.LastAttemptAt.IsZero() {
+			continue
+		}
+		if now.Before(item.LastAttemptAt.Add(rp.ReceiptTimeout)) {
+			continue
+		}
+		item.LastError = "receipt timeout"
+		s.scheduleRetryOrFailLocked(item, "receipt_timeout", now)
+		n++
+	}
+	if n > 0 {
+		if err := s.commitLocked(); err != nil {
+			return 0, err
+		}
+	}
+	return n, nil
+}
+
+// ReportReceipt 处理一条渠道回执。
+//
+// 保证：
+//   - 回执按 (事件, 步骤, 目标, 意图版本) 匹配意图；版本落后于当前意图时
+//     返回 ErrStaleReceipt，绝不把更高版本的状态改回去；
+//   - 相同 ReceiptID 重放返回第一次的处理结果；同号异内容返回 ErrConflict；
+//   - 已 acknowledged 的意图不会被迟到的失败回执降回失败；
+//   - 回执处理、状态推进与历史追加在同一次原子写入中落盘。
+func (s *Store) ReportReceipt(req ReceiptRequest, now time.Time) (ReceiptResult, error) {
+	if strings.TrimSpace(req.ReceiptID) == "" {
+		return ReceiptResult{}, fmt.Errorf("%w: receipt id is required", ErrInvalidArgument)
+	}
+	if strings.TrimSpace(req.IncidentID) == "" || strings.TrimSpace(req.Target) == "" {
+		return ReceiptResult{}, fmt.Errorf("%w: incident id and target are required", ErrInvalidArgument)
+	}
+	if req.Outcome != ReceiptAccepted && req.Outcome != ReceiptFailed {
+		return ReceiptResult{}, fmt.Errorf("%w: unknown receipt outcome %q", ErrInvalidArgument, req.Outcome)
+	}
+	content := struct {
+		IncidentID    string         `json:"incident_id"`
+		StepIndex     int            `json:"step_index"`
+		Target        string         `json:"target"`
+		IntentVersion int            `json:"intent_version"`
+		Outcome       ReceiptOutcome `json:"outcome"`
+		Error         string         `json:"error"`
+	}{req.IncidentID, req.StepIndex, req.Target, req.IntentVersion, req.Outcome, req.Error}
+	fp := fingerprint(content)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 幂等：相同回执重放返回第一次处理结果；同号异内容冲突。
+	if rec, ok := s.snap.Receipts[req.ReceiptID]; ok {
+		if rec.Fingerprint != fp {
+			return ReceiptResult{}, fmt.Errorf("%w: receipt id %q reused with different payload", ErrConflict, req.ReceiptID)
+		}
+		res := ReceiptResult{Applied: rec.Applied, Status: rec.Status, Reason: rec.Reason}
+		if rec.ErrKind == "stale" {
+			return res, fmt.Errorf("%w: receipt %q", ErrStaleReceipt, req.ReceiptID)
+		}
+		return res, nil
+	}
+
+	item := s.findIntentLocked(req.IncidentID, req.StepIndex, req.Target)
+	if item == nil {
+		return ReceiptResult{}, fmt.Errorf("%w: intent (%s, step %d, %s)",
+			ErrNotFound, req.IncidentID, req.StepIndex, req.Target)
+	}
+
+	var res ReceiptResult
+	var errKind string
+	switch {
+	case req.IntentVersion != item.Version:
+		// 迟到回执：意图已进入更高版本，拒绝改回。
+		res = ReceiptResult{Applied: false, Status: item.Status, Reason: "stale_intent_version"}
+		errKind = "stale"
+		s.appendHistoryLocked(item.IncidentID, "receipt_ignored",
+			fmt.Sprintf("step=%d target=%s receipt=%s reason=stale_intent_version receipt_version=%d current_version=%d",
+				item.StepIndex, item.Target, req.ReceiptID, req.IntentVersion, item.Version), now)
+	case item.Status == DeliveryAcknowledged:
+		// 成功之后到达的回执（含失败）都不能把状态降回去。
+		res = ReceiptResult{Applied: false, Status: item.Status, Reason: "already_acknowledged"}
+		if req.Outcome == ReceiptFailed {
+			s.appendHistoryLocked(item.IncidentID, "receipt_ignored",
+				fmt.Sprintf("step=%d target=%s receipt=%s reason=failure_after_acknowledged",
+					item.StepIndex, item.Target, req.ReceiptID), now)
+		}
+	case item.Status == DeliveryFailed || item.Status == DeliveryStopped:
+		res = ReceiptResult{Applied: false, Status: item.Status, Reason: "already_terminal"}
+		s.appendHistoryLocked(item.IncidentID, "receipt_ignored",
+			fmt.Sprintf("step=%d target=%s receipt=%s reason=already_terminal status=%s",
+				item.StepIndex, item.Target, req.ReceiptID, item.Status), now)
+	case req.Outcome == ReceiptAccepted:
+		item.Status = DeliveryAcknowledged
+		item.AckedAt = now
+		item.NextAttemptAt = time.Time{}
+		s.appendHistoryLocked(item.IncidentID, "delivery_acknowledged",
+			fmt.Sprintf("step=%d target=%s receipt=%s version=%d",
+				item.StepIndex, item.Target, req.ReceiptID, req.IntentVersion), now)
+		res = ReceiptResult{Applied: true, Status: item.Status, Reason: "applied"}
+	default: // ReceiptFailed
+		item.LastError = req.Error
+		s.scheduleRetryOrFailLocked(item, "receipt_failed", now)
+		res = ReceiptResult{Applied: true, Status: item.Status, Reason: "applied"}
+	}
+
+	s.snap.Receipts[req.ReceiptID] = receiptRecord{
+		Fingerprint: fp,
+		Applied:     res.Applied,
+		Status:      res.Status,
+		Reason:      res.Reason,
+		ErrKind:     errKind,
+	}
+	if err := s.commitLocked(); err != nil {
+		return ReceiptResult{}, err
+	}
+	if errKind == "stale" {
+		return res, fmt.Errorf("%w: receipt %q", ErrStaleReceipt, req.ReceiptID)
+	}
+	return res, nil
+}
+
+// IncidentDelivery 返回事件级投递视图：事件本体、升级进度（已触发步骤数）
+// 以及每个通知目标的最终投递结果。
+func (s *Store) IncidentDelivery(incidentID string) (*IncidentDeliveryView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	inc, ok := s.snap.Incidents[incidentID]
+	if !ok {
+		return nil, fmt.Errorf("%w: incident %q", ErrNotFound, incidentID)
+	}
+	view := &IncidentDeliveryView{
+		Incident:        cloneIncident(inc),
+		EscalationLevel: inc.NextStepIndex,
+	}
+	for _, item := range s.snap.Outbox {
+		if item.IncidentID != incidentID {
+			continue
+		}
+		view.Deliveries = append(view.Deliveries, TargetDelivery{
+			StepIndex:     item.StepIndex,
+			Target:        item.Target,
+			Channel:       item.Channel,
+			Status:        item.Status,
+			Version:       item.Version,
+			Attempts:      item.Attempts,
+			LastError:     item.LastError,
+			LastAttemptAt: item.LastAttemptAt,
+			AckedAt:       item.AckedAt,
+			StopReason:    item.StopReason,
+		})
+	}
+	sort.Slice(view.Deliveries, func(i, j int) bool {
+		if view.Deliveries[i].StepIndex != view.Deliveries[j].StepIndex {
+			return view.Deliveries[i].StepIndex < view.Deliveries[j].StepIndex
+		}
+		return view.Deliveries[i].Target < view.Deliveries[j].Target
+	})
+	return view, nil
 }
 
 // ---------- 历史 ----------
