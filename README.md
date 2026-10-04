@@ -2,7 +2,7 @@
 
 值班事件升级服务：事件开始后按冻结的升级策略，分步、定时地通知不同目标；
 值班人员确认后停止升级，事件解决后不再确认或通知。
-所有状态（事件、定时器、通知 outbox、幂等请求表、历史）一次性原子落盘，
+所有状态（事件、定时器、通知 outbox、投递回执表、幂等请求表、历史）一次性原子落盘，
 **进程重启后会从持久化的定时器继续执行**。
 
 开发环境：Go 1.23.0，仅依赖标准库。
@@ -48,7 +48,11 @@
 | 解决（禁止确认与通知） | `Store.Resolve` |
 | 到期推进（后台循环或手工调用） | `Store.ProcessDue(now)` |
 | 查看定时器 | `Store.NextDue` / `Store.Timer` |
-| 通知 outbox | `Store.PendingOutbox` / `ListOutbox` / `MarkDelivered` |
+| 通知 outbox | `Store.PendingOutbox` / `ListOutbox` / `DueOutbox(now)` |
+| 投递状态推进 | `Store.MarkDispatched` / `MarkAttemptFailed` / `MarkDelivered` |
+| 渠道回执 | `Store.ReportReceipt(ReceiptRequest, now)` |
+| 重试策略 | `Store.SetRetryPolicy` / `RetryPolicyOf`（持久化） |
+| 事件级投递视图 | `Store.IncidentDelivery(incidentID)` |
 | 历史查询 | `Store.History(incidentID)`（空 ID 查全部） |
 | 持久化 / 内存存储 | `OpenStore(path)` / `NewMemoryStore()` |
 | 后台自动推进与投递 | `NewService(store, dispatcher, cfg)` + `Start` / `Stop` |
@@ -64,6 +68,8 @@
 | `ErrAlreadyAcknowledged` | 新的确认请求到达时事件已确认 |
 | `ErrAlreadyResolved` | 新的解决请求到达时事件已解决 |
 | `ErrIncidentResolved` | 事件已解决后再确认（解决后也不再通知） |
+| `ErrStaleReceipt` | 回执携带的意图版本落后于当前版本（迟到回执），状态不被改回 |
+| `ErrDeliveryClosed` | 意图已进入终态（acknowledged/failed/stopped），不能再投递或重试 |
 
 ## 使用示例
 
@@ -103,17 +109,57 @@ store.Acknowledge(incidentescalation.AckRequest{
 
 更多端到端用法见 `example_test.go`。
 
+## 投递状态与回执
+
+每条通知意图（`OutboxItem`）有自己的投递状态机，与事件状态、历史在同一次
+原子写入中落盘；重试只更新本条意图，**绝不会生成第二条意图**：
+
+| 状态 | 含义 |
+| --- | --- |
+| `pending` | 意图已生成，等待（首次或重试）交给渠道 |
+| `dispatched` | 已交给渠道，等待渠道回执 |
+| `acknowledged` | 渠道明确接收（终态） |
+| `failed` | 最终投递失败：尝试次数达到 `RetryPolicy.MaxAttempts`（终态） |
+| `stopped` | 事件已确认/解决，未完成的投递被停止（终态，`StopReason` 记录原因） |
+
+意图同时记录 `Attempts`（尝试次数）、`LastError`（最近错误）、
+`LastAttemptAt`（最后尝试时间）、`NextAttemptAt`（下次可重试时间，持久化）、
+`AckedAt`（渠道确认时间）与 `Version`（意图版本，每次交给渠道递增）。
+
+**渠道回执**（`ReportReceipt`）按 `(事件, 步骤, 目标, 意图版本)` 匹配意图：
+
+- 回执可重复、乱序、或在进程重启后到达：`ReceiptID` 幂等，
+  相同回执重放返回第一次的处理结果，同号异内容返回 `ErrConflict`；
+- 版本落后于当前意图的迟到回执返回 `ErrStaleReceipt`，状态不被改回；
+- 已 `acknowledged` 之后到达的失败回执被忽略（记入历史），不会降回失败；
+- 事件确认/解决时，所有 `pending`/`dispatched` 意图原子地变为 `stopped`
+  并留下停止原因（`incident_acknowledged` / `incident_resolved`），
+  之后到达的回执不再生效。
+
+**重试策略**（`RetryPolicy`，持久化）：`MaxAttempts`（最大尝试次数，默认 3）、
+`Backoff`（失败退避，默认 0）、`ReceiptTimeout`（等待回执超时，默认 1 分钟，
+超时视为失败尝试并重新入队）。待重试意图完全由持久化的 `NextAttemptAt` 驱动，
+进程重启后 `DueOutbox` / 后台 `Service` 会接着处理。
+
+**事件级投递视图**：`Store.IncidentDelivery(id)` 返回事件本体、
+`EscalationLevel`（已触发的升级步骤数）以及每个通知目标的最终投递结果
+（状态、尝试次数、最近错误、确认时间、停止原因）。
+每次投递状态变化都会向事件历史追加一条带原因的记录
+（`delivery_dispatched` / `delivery_retry_scheduled` / `delivery_acknowledged` /
+`delivery_failed` / `delivery_stopped` / `receipt_ignored`）。
+
 ## Outbox 投递语义
 
 `Dispatcher` 为 **at-least-once**：若进程在“已通知下游、尚未标记 delivered”之间崩溃，
 重启后该意图会再次投递。下游通知渠道应按 `OutboxItem.ID`
-（等价于 `(事件, 步骤, 目标)`）做幂等。投递失败的意图保持 `pending`，
-后续周期自动重试，不阻塞其它意图。
+（等价于 `(事件, 步骤, 目标)`）做幂等。投递失败的意图按重试策略退避后
+自动重试（达到上限进入 `failed` 终态），不阻塞其它意图。
 
 ## 持久化格式
 
-单个 JSON 快照文件，包含策略、事件（含冻结步骤与进度）、定时器表、outbox、
-通知意图去重集合、外部请求幂等表与历史。写入采用同目录临时文件 rename，
+单个 JSON 快照文件，包含策略、事件（含冻结步骤与进度）、定时器表、outbox
+（含投递状态与重试时间）、通知意图去重集合、外部请求幂等表、回执幂等表、
+重试策略与历史。写入采用同目录临时文件 rename，
 崩溃时只会保留上一份完整文件，不会出现半截状态。需要更强扩展性时，
 可将 `Store` 内部替换为带事务的数据库实现，领域语义（同锁内推进 + 意图去重）不变。
 
@@ -129,3 +175,9 @@ store.Acknowledge(incidentescalation.AckRequest{
 - 同请求号并发创建只产生一个事件；
 - 落盘后重新 `OpenStore`：定时器、outbox、事件进度、幂等表全部恢复并继续推进；
 - 后台 `Service` 循环按序投递、投递失败重试、确认后后续步骤不再触发。
+- 回执乱序与迟到：低版本回执被拒（`ErrStaleReceipt`），成功后的失败回执不降状态；
+- 重试上限：达到 `MaxAttempts` 进入 `failed` 终态，终态后拒绝再投递；
+- 确认与回执/重试竞态：确认后待重试投递停止并留下原因，迟到回执不再生效；
+- 重启恢复：退避中的待重试意图、回执幂等表、终态全部从快照恢复；
+- 重复回执：重放返回首次结果且不重复写历史，同号异内容报 `ErrConflict`；
+- 回执超时重新入队、事件级投递视图（升级级别 + 每个目标的最终投递结果）。

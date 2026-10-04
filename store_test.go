@@ -517,7 +517,7 @@ func TestHistory(t *testing.T) {
 	for i, e := range h {
 		kinds[i] = e.Kind
 	}
-	want := []string{"created", "step_fired", "acknowledged"}
+	want := []string{"created", "step_fired", "delivery_stopped", "delivery_stopped", "acknowledged"}
 	if fmt.Sprint(kinds) != fmt.Sprint(want) {
 		t.Fatalf("history kinds = %v, want %v", kinds, want)
 	}

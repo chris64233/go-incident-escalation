@@ -87,5 +87,6 @@ func Example() {
 	// 通知意图: step=0 target=oncall-l1
 	// 历史: created
 	// 历史: step_fired
+	// 历史: delivery_stopped
 	// 历史: acknowledged
 }

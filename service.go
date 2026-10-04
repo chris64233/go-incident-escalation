@@ -24,6 +24,8 @@ type Config struct {
 	TickInterval time.Duration
 	// DispatchInterval 是后台捞取 pending outbox 的间隔。默认 100ms。
 	DispatchInterval time.Duration
+	// RetryPolicy 非零时覆盖存储的投递重试策略（持久化）。
+	RetryPolicy RetryPolicy
 	// Now 可注入时钟（测试用）；为 nil 时用 time.Now。
 	Now func() time.Time
 }
@@ -54,6 +56,9 @@ func NewService(store *Store, dispatcher Dispatcher, cfg Config) *Service {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.RetryPolicy != (RetryPolicy{}) {
+		_ = store.SetRetryPolicy(cfg.RetryPolicy)
 	}
 	return &Service{store: store, dispatcher: dispatcher, cfg: cfg}
 }
@@ -128,12 +133,17 @@ func (svc *Service) runDispatch(stop, stopped chan struct{}) {
 }
 
 func (svc *Service) drainOutbox() {
-	for _, item := range svc.store.PendingOutbox() {
+	now := svc.cfg.Now()
+	// 等待回执超时的意图先重新入队（或按重试上限置为最终失败）。
+	_, _ = svc.store.RequeueTimedOutDispatches(now)
+	for _, item := range svc.store.DueOutbox(now) {
 		if err := svc.dispatcher.Dispatch(*item); err != nil {
-			// 投递失败：保留 pending，下轮重试；跳过本条，不阻塞其它意图。
+			// 投递失败：记录尝试并按重试策略退避/终止；跳过本条，不阻塞其它意图。
+			_ = svc.store.MarkAttemptFailed(item.ID, err.Error(), now)
 			continue
 		}
-		_ = svc.store.MarkDelivered(item.ID, svc.cfg.Now())
+		// 已交给渠道：等待渠道回执（ReportReceipt）确认；调用方也可 MarkDelivered。
+		_ = svc.store.MarkDispatched(item.ID, now)
 	}
 }
 
